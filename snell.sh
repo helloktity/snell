@@ -3847,7 +3847,8 @@ echo -e "${CYAN}正在获取最新版本的管理脚本...${RESET}"
 TMP_SCRIPT=$(mktemp)
 if curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 SNELL_SCRIPT_URL_PLACEHOLDER -o "$TMP_SCRIPT" \
     && [ -s "$TMP_SCRIPT" ] && bash -n "$TMP_SCRIPT" 2>/dev/null; then
-    bash "$TMP_SCRIPT"
+    # 参数要透传：snell sub check 之类不带参数就会被当成交互菜单，卡在 read 上
+    bash "$TMP_SCRIPT" "$@"
     rm -f "$TMP_SCRIPT"
 else
     echo -e "${RED}下载或校验脚本失败，请检查网络连接。${RESET}"
@@ -3866,6 +3867,11 @@ EOFSCRIPT
 upgrade_management_script() {
     [ -f /usr/local/bin/snell ] || return 0
     grep -qE 'raw\.githubusercontent\.com/(jinqians|helloktity)/snell(\.sh)?/|snell\.jinqians\.com' /usr/local/bin/snell 2>/dev/null || return 0
+    # 已经是当前写法（地址一致、参数会透传）就不再重写，否则每次运行都会覆盖一遍
+    if grep -qF "${SNELL_SCRIPT_URL}" /usr/local/bin/snell 2>/dev/null \
+        && grep -qF 'bash "$TMP_SCRIPT" "$@"' /usr/local/bin/snell 2>/dev/null; then
+        return 0
+    fi
     write_management_script && echo -e "${GREEN}已更新 snell 管理命令（改为每次获取最新脚本）${RESET}"
 }
 
