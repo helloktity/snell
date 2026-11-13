@@ -1,0 +1,1011 @@
+# ── lib/subscription.sh ───────────────────────────────────────────────────────
+# 订阅服务：把本机的 Snell 用户（含 ShadowTLS）以订阅链接输出，Sub-Store 可以
+# 像订阅 3x-ui 那样用 source=remote 订阅本机，Mihomo / Surge 也能直接导入。
+#
+# 输出目标：clash（默认，给 Sub-Store 与 Mihomo）、clash-full、surge（含 v6 与
+# ShadowTLS）、base64、json、health。Clash 目标会自动跳过 Mihomo 不支持的节点
+# （snell v6、ShadowTLS），并在响应里用注释说明跳过了什么。
+#
+# 服务是纯 python3 标准库的 HTTP 服务（不需要 pip），配置在
+# ${SNELL_CONF_DIR}/.subscription（600），token 写在路径里。每次请求都重新读
+# 配置文件与 users/*.conf，所以加用户、改 PSK 之后订阅立即生效，不用重启。
+#
+# 由 snell.sh 引用（# @bundle），不单独发布。
+
+SNELL_SUB_CONF="${SNELL_CONF_DIR}/.subscription"
+SNELL_SUB_SVC="${INSTALL_DIR}/snell-subscription"
+SNELL_SUB_UNIT="${SYSTEMD_DIR}/snell-subscription.service"
+SNELL_SUB_UNIT_NAME="snell-subscription"
+SNELL_SUB_PORT_DEFAULT="13357"
+
+# 读配置里某个键的值
+snell_sub_get() {   # <key>
+    [ -f "$SNELL_SUB_CONF" ] || return 1
+    sed -n "s/^$1=//p" "$SNELL_SUB_CONF" | tail -n 1
+}
+
+# 幂等写入配置（文件 600：里面的 token 等同凭据）
+snell_sub_set() {   # <key> <value>
+    mkdir -p "$(dirname "$SNELL_SUB_CONF")" 2>/dev/null || true
+    touch "$SNELL_SUB_CONF" 2>/dev/null || return 1
+    if grep -q "^$1=" "$SNELL_SUB_CONF" 2>/dev/null; then
+        sed -i "s|^$1=.*|$1=$2|" "$SNELL_SUB_CONF"
+    else
+        echo "$1=$2" >> "$SNELL_SUB_CONF"
+    fi
+    chmod 600 "$SNELL_SUB_CONF" 2>/dev/null || true
+}
+
+snell_sub_token_new() { tr -dc A-Za-z0-9 < /dev/urandom | head -c 40; }
+
+# 生成默认配置。已有的键不动，所以重复执行不会把 token / 端口换掉
+snell_sub_ensure_conf() {
+    mkdir -p "${SNELL_CONF_DIR}" 2>/dev/null || true
+    [ -f "$SNELL_SUB_CONF" ] || : > "$SNELL_SUB_CONF"
+    chmod 600 "$SNELL_SUB_CONF" 2>/dev/null || true
+
+    [ -n "$(snell_sub_get SUB_TOKEN)" ] || snell_sub_set SUB_TOKEN "$(snell_sub_token_new)"
+    [ -n "$(snell_sub_get SUB_PORT)" ] || snell_sub_set SUB_PORT "$SNELL_SUB_PORT_DEFAULT"
+    [ -n "$(snell_sub_get SUB_BIND)" ] || snell_sub_set SUB_BIND "127.0.0.1"
+    [ -n "$(snell_sub_get SUB_ENABLED)" ] || snell_sub_set SUB_ENABLED "1"
+    grep -q '^SUB_SERVER=' "$SNELL_SUB_CONF" 2>/dev/null || snell_sub_set SUB_SERVER ""
+    grep -q '^SUB_COUNTRY=' "$SNELL_SUB_CONF" 2>/dev/null || snell_sub_set SUB_COUNTRY ""
+
+    # 节点地址与地区只在为空时自动补，用户手动设过就尊重手动值
+    if [ -z "$(snell_sub_get SUB_SERVER)" ]; then
+        local ip
+        ip=$(get_public_ipv4 2>/dev/null)
+        [ -n "$ip" ] && snell_sub_set SUB_SERVER "$ip"
+    fi
+    if [ -z "$(snell_sub_get SUB_COUNTRY)" ]; then
+        local address country
+        address=$(snell_sub_get SUB_SERVER)
+        if [ -n "$address" ]; then
+            country=$(get_ip_country "$address" 2>/dev/null)
+            case "$country" in
+                [A-Z][A-Z]) snell_sub_set SUB_COUNTRY "$country" ;;
+            esac
+        fi
+    fi
+    return 0
+}
+
+# 订阅服务本体（python3 标准库；改这里的话同步改仓库里的同名 .py）
+snell_sub_write_service() {
+    mkdir -p "$(dirname "$SNELL_SUB_SVC")" || return 1
+    cat > "$SNELL_SUB_SVC" <<'SNELLSUB_PY'
+#!/usr/bin/env python3
+"""Snell subscription endpoint.
+
+Reads the local Snell users (``/etc/snell/users/*.conf``) and the ShadowTLS
+units that front them, then serves them as a subscription so that Sub-Store can
+consume this host with ``source=remote`` (the same way it consumes 3x-ui).
+
+Routes (TOKEN comes from ``/etc/snell/.subscription``)::
+
+    GET /<TOKEN>/sub                       Clash proxies fragment (default)
+    GET /<TOKEN>/sub?target=clash          same as above
+    GET /<TOKEN>/sub?target=clash-full     ready-to-use Clash config
+    GET /<TOKEN>/sub?target=surge          Surge proxy lines (all versions)
+    GET /<TOKEN>/sub?target=base64         base64 of the Surge lines
+    GET /<TOKEN>/sub?target=json           JSON {"proxies": [...]}
+    GET /<TOKEN>/clash.yaml                alias of target=clash
+    GET /<TOKEN>/full.yaml                 alias of target=clash-full
+    GET /<TOKEN>/surge.txt                 alias of target=surge
+    GET /<TOKEN>/base64.txt                alias of target=base64
+    GET /<TOKEN>/json                      alias of target=json
+    GET /<TOKEN>/health                    liveness probe
+
+Every response is ``no-store``: the accounts change whenever a user is added or
+a PSK is rotated, and both Sub-Store and the clients must see the new values.
+Extra query parameters (``noCache=true``, ``target=ClashMeta`` ...) are ignored
+so one URL can be shared by Sub-Store and a client.
+
+Two things Clash clients cannot use are filtered out of the Clash targets by
+default, because emitting them would make the whole profile invalid:
+
+* Snell v6 (Mihomo only accepts version 4 and 5)
+* ShadowTLS-wrapped nodes (Mihomo's snell outbound has no shadow-tls plugin)
+
+The Surge targets carry everything, since Surge supports all of it. Nothing is
+lost silently: the skipped nodes are listed in a YAML comment.
+
+Only the Python standard library is used, so no pip install is needed.
+"""
+
+import base64
+import hmac
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+CONF_PATH = os.environ.get('SNELL_SUB_CONF', '/etc/snell/.subscription')
+UNIT_DIR = os.environ.get('SNELL_SUB_UNIT_DIR', '/etc/systemd/system')
+
+CLASH_VERSIONS = (4, 5)          # versions the Mihomo snell outbound accepts
+IP_CACHE_TTL = 600              # seconds to reuse a detected public address
+UNIT_CACHE_TTL = 15             # seconds to reuse systemd is-active answers
+
+_ip_cache = {'value': '', 'at': 0.0}
+_unit_cache = {}
+
+
+# ── configuration ────────────────────────────────────────────────────────────
+
+def read_conf(path=CONF_PATH):
+    conf = {}
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                conf[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return conf
+
+
+def conf_value(conf, key, default=''):
+    value = conf.get(key, '')
+    return value if value != '' else default
+
+
+# ── reading the installed users ──────────────────────────────────────────────
+
+def parse_conf_file(path):
+    """Parse one snell-*.conf: the same keys the shell side writes."""
+    values = {}
+    marker = ''
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                m = re.match(r'^#\s*version-choice\s*=\s*(v[456])\s*$', line)
+                if m:
+                    marker = m.group(1)
+                    continue
+                if line.startswith('#') or '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                values[key.strip()] = value.strip()
+    except OSError:
+        return None
+
+    ports = re.findall(r':(\d+)', values.get('listen', ''))
+    if not ports:
+        return None
+    return {
+        'conf': path,
+        'port': int(ports[-1]),
+        'psk': values.get('psk', ''),
+        'mode': values.get('mode', ''),
+        'version': marker,          # empty => fall back to the unit below
+        'ipv6': values.get('ipv6', ''),
+    }
+
+
+def unit_channel(service):
+    """Which channel a unit runs (ExecStart=.../snell-server-v5)."""
+    path = os.path.join(UNIT_DIR, service)
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+            text = fh.read()
+    except OSError:
+        return ''
+    m = re.search(r'ExecStart=\S*snell-server-(v[456])\b', text)
+    return m.group(1) if m else ''
+
+
+def unit_active(service):
+    """systemd unit active? Answers are cached; non-systemd hosts say yes."""
+    if not os.path.isdir('/run/systemd/system'):
+        return True
+    now = time.time()
+    hit = _unit_cache.get(service)
+    if hit and now - hit[1] < UNIT_CACHE_TTL:
+        return hit[0]
+    try:
+        rc = subprocess.run(['systemctl', 'is-active', '--quiet', service],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=5).returncode
+        active = rc == 0
+    except (OSError, subprocess.SubprocessError):
+        active = True
+    _unit_cache[service] = (active, now)
+    return active
+
+
+def collect_users():
+    """Every enabled Snell user, with the version resolved as the shell does."""
+    users_dir = os.path.join(os.path.dirname(CONF_PATH), 'users')
+    try:
+        names = sorted(os.listdir(users_dir))
+    except OSError:
+        return []
+
+    # main user first, the rest by port: the main one is the node people look for
+    def order(name):
+        if name == 'snell-main.conf':
+            return (0, 0)
+        match = re.search(r'(\d+)\.conf$', name)
+        return (1, int(match.group(1)) if match else 0)
+
+    users = []
+    for name in sorted(names, key=order):
+        if not name.endswith('.conf'):
+            continue
+        parsed = parse_conf_file(os.path.join(users_dir, name))
+        if not parsed or not parsed['psk']:
+            continue
+        if not parsed['version']:
+            # no marker (older install): the unit knows which binary it runs
+            main_port = users[0]['port'] if users else None
+            service = 'snell.service' if main_port == parsed['port'] else 'snell-%d.service' % parsed['port']
+            parsed['version'] = unit_channel(service) or unit_channel('snell.service') or 'v4'
+        if parsed['version'] == 'v6' and not parsed['mode']:
+            parsed['mode'] = 'default'
+        parsed['service'] = ('snell.service' if name == 'snell-main.conf'
+                             else 'snell-%d.service' % parsed['port'])
+        parsed['active'] = unit_active(parsed['service'])
+        users.append(parsed)
+    return users
+
+
+def collect_shadowtls(users):
+    """ShadowTLS v3 units that front a local Snell user."""
+    by_port = {u['port']: u for u in users}
+    try:
+        names = sorted(os.listdir(UNIT_DIR))
+    except OSError:
+        return []
+
+    nodes = []
+    for name in names:
+        if not (name.startswith('shadowtls-snell-') and name.endswith('.service')):
+            continue
+        try:
+            with open(os.path.join(UNIT_DIR, name), 'r', encoding='utf-8', errors='replace') as fh:
+                exec_line = ''
+                for line in fh:
+                    if line.startswith('ExecStart='):
+                        exec_line = line.strip()
+                        break
+        except OSError:
+            continue
+        if not exec_line:
+            continue
+
+        def grab(pattern):
+            m = re.search(pattern, exec_line)
+            return m.group(1) if m else ''
+
+        listen_port = grab(r'--listen\s+\S*:(\d+)')
+        backend_port = grab(r'--server\s+\S*:(\d+)')
+        password = grab(r'--password\s+(\S+)')
+        sni = grab(r'--tls\s+([^\s]+)')
+        if not (listen_port and backend_port and password):
+            continue
+        backend = by_port.get(int(backend_port))
+        if not backend or not unit_active(name):
+            continue
+        nodes.append({
+            'port': int(listen_port),
+            'backend_port': int(backend_port),
+            'psk': backend['psk'],
+            'version': backend['version'],
+            'mode': backend['mode'],
+            'password': password,
+            'sni': sni,
+            'service': name,
+        })
+    return nodes
+
+
+# ── addressing ───────────────────────────────────────────────────────────────
+
+def detect_public_ip(conf):
+    """Configured address first; otherwise ask once and cache for a while."""
+    explicit = conf_value(conf, 'SUB_SERVER')
+    if explicit:
+        return explicit
+
+    now = time.time()
+    if _ip_cache['value'] and now - _ip_cache['at'] < IP_CACHE_TTL:
+        return _ip_cache['value']
+    for url in ('https://api.ipify.org', 'https://ifconfig.me/ip'):
+        try:
+            with urllib.request.urlopen(url, timeout=4) as resp:
+                candidate = resp.read(64).decode('ascii', 'replace').strip()
+        except Exception:                                   # noqa: BLE001 - any failure means "try the next one"
+            continue
+        if re.match(r'^[0-9a-fA-F:.]+$', candidate):
+            _ip_cache.update(value=candidate, at=now)
+            return candidate
+    return ''
+
+
+def node_name(conf, prefix, version, port, stls=False):
+    parts = []
+    tag = conf_value(conf, 'SUB_TAG')
+    if tag:
+        parts.append(tag)
+    if prefix:
+        parts.append(prefix)
+    parts.append('Snell')
+    if stls:
+        parts.append('STLS')
+    parts.append(version)
+    parts.append(str(port))
+    return '-'.join(parts)
+
+
+def build_nodes(conf):
+    """Normalised node list, Clash-ready fields included."""
+    users = collect_users()
+    stls = collect_shadowtls(users)
+    hidden = [u for u in users if not u['active']]
+    users = [u for u in users if u['active']]
+
+    server = detect_public_ip(conf)
+    country = conf_value(conf, 'SUB_COUNTRY')
+    nodes = []
+
+    for u in users:
+        digits = int(u['version'][1:])
+        nodes.append({
+            'name': node_name(conf, country, u['version'], u['port']),
+            'server': server,
+            'port': u['port'],
+            'psk': u['psk'],
+            'version': digits,
+            'mode': u['mode'],
+            'stls': None,
+            'udp': True,
+        })
+
+    for s in stls:
+        digits = int(s['version'][1:])
+        nodes.append({
+            'name': node_name(conf, country, s['version'], s['port'], stls=True),
+            'server': server,
+            'port': s['port'],
+            'psk': s['psk'],
+            'version': digits,
+            'mode': s['mode'],
+            'stls': {'password': s['password'], 'sni': s['sni'], 'version': 3},
+            'udp': True,
+        })
+
+    return nodes, hidden
+
+
+# ── rendering ────────────────────────────────────────────────────────────────
+
+def yaml_quote(value):
+    return '"%s"' % str(value).replace('\\', '\\\\').replace('"', '\\"')
+
+
+def clash_skip_reason(node, include_v6):
+    if node['stls']:
+        return 'ShadowTLS 需要 Surge，Mihomo 的 snell 出站不支持'
+    if node['version'] not in CLASH_VERSIONS and not include_v6:
+        return 'Mihomo 只接受 version 4 / 5'
+    return ''
+
+
+def render_clash(nodes, conf, hidden, include_v6=False):
+    lines = []
+    skipped = []
+    usable = []
+    for node in nodes:
+        reason = clash_skip_reason(node, include_v6)
+        if reason:
+            skipped.append('%s（%s）' % (node['name'], reason))
+        else:
+            usable.append(node)
+
+    if skipped:
+        lines.append('# 已跳过 %d 个此目标无法使用的节点：' % len(skipped))
+        for item in skipped:
+            lines.append('#   - %s' % item)
+    if hidden:
+        lines.append('# 已跳过 %d 个未在运行的服务：%s'
+                     % (len(hidden), ', '.join(str(u['port']) for u in hidden)))
+    if not usable:
+        lines.append('# 没有可用的节点：本机只有 Surge 才能用的 Snell（v6 / ShadowTLS）')
+        lines.append('proxies: []')
+
+    if usable:
+        lines.append('proxies:')
+    for node in usable:
+        lines.append('  - name: %s' % yaml_quote(node['name']))
+        lines.append('    type: snell')
+        lines.append('    server: %s' % yaml_quote(node['server']))
+        lines.append('    port: %d' % node['port'])
+        lines.append('    psk: %s' % yaml_quote(node['psk']))
+        lines.append('    version: %d' % node['version'])
+        if node['udp']:
+            lines.append('    udp: true')
+    return '\n'.join(lines) + '\n'
+
+
+def render_clash_full(nodes, conf, hidden, include_v6=False):
+    fragment = render_clash(nodes, conf, hidden, include_v6)
+    names = re.findall(r'^  - name: "(.*)"$', fragment, re.M)
+    head = [
+        '# Snell-Plus 生成的完整 Clash 配置（可直接导入 Mihomo / Clash Verge）',
+        'mixed-port: 7890',
+        'allow-lan: false',
+        'mode: rule',
+        'log-level: info',
+        'external-controller: 127.0.0.1:9090',
+        '',
+    ]
+    body = fragment.rstrip('\n').split('\n')
+    tail = ['', 'proxy-groups:', '  - name: Proxy', '    type: select', '    proxies:']
+    if names:
+        tail.extend('      - %s' % yaml_quote(name) for name in names)
+    tail.append('      - DIRECT')
+    tail.extend(['', 'rules:', '  - MATCH,Proxy', ''])
+    return '\n'.join(head + body + tail)
+
+
+def surge_line(node):
+    parts = ['%s = snell' % node['name'],
+             str(node['server']),
+             str(node['port']),
+             'psk = %s' % node['psk'],
+             'version = %d' % node['version']]
+    if node['version'] >= 6 and node['mode']:
+        parts.append('mode = %s' % node['mode'])
+    parts.append('reuse = true')
+    parts.append('tfo = true')
+    if node['stls']:
+        if node['stls']['password']:
+            parts.append('shadow-tls-password = %s' % node['stls']['password'])
+        if node['stls']['sni']:
+            parts.append('shadow-tls-sni = %s' % node['stls']['sni'])
+        parts.append('shadow-tls-version = %d' % node['stls']['version'])
+    return ', '.join(parts)
+
+
+def render_surge(nodes, hidden):
+    lines = []
+    if hidden:
+        lines.append('# 已跳过 %d 个未在运行的服务：%s'
+                     % (len(hidden), ', '.join(str(u['port']) for u in hidden)))
+    lines.extend(surge_line(node) for node in nodes)
+    if not nodes:
+        lines.append('# 没有可用的节点：确认至少有一个用户的 snell 服务在运行')
+    return '\n'.join(lines) + '\n'
+
+
+def render_json(nodes):
+    payload = []
+    for node in nodes:
+        item = {
+            'name': node['name'],
+            'type': 'snell',
+            'server': node['server'],
+            'port': node['port'],
+            'psk': node['psk'],
+            'version': node['version'],
+        }
+        if node['mode']:
+            item['mode'] = node['mode']
+        if node['stls']:
+            item['shadow-tls'] = node['stls']
+        payload.append(item)
+    return json.dumps({'proxies': payload}, ensure_ascii=False, indent=2) + '\n'
+
+
+def render(target):
+    conf = read_conf()
+    nodes, hidden = build_nodes(conf)
+    include_v6 = conf_value(conf, 'SUB_INCLUDE_V6') == '1'
+
+    if target in ('clash-full', 'full', 'config'):
+        return render_clash_full(nodes, conf, hidden, include_v6), 'text/yaml; charset=utf-8'
+    if target in ('surge', 'surge-list'):
+        return render_surge(nodes, hidden), 'text/plain; charset=utf-8'
+    if target in ('base64', 'b64', 'v2ray', 'general'):
+        text = render_surge(nodes, hidden)
+        return base64.b64encode(text.encode('utf-8')).decode('ascii') + '\n', 'text/plain; charset=utf-8'
+    if target in ('json', 'js'):
+        return render_json(nodes), 'application/json; charset=utf-8'
+    return render_clash(nodes, conf, hidden, include_v6), 'text/yaml; charset=utf-8'
+
+
+PATH_TARGETS = {
+    'sub': '',
+    'clash.yaml': 'clash',
+    'clash': 'clash',
+    'full.yaml': 'clash-full',
+    'surge.txt': 'surge',
+    'base64.txt': 'base64',
+    'json': 'json',
+}
+
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = 'SnellSubscription/1.0'
+    sys_version = ''
+
+    def log_message(self, fmt, *args):                       # keep the journal short
+        sys.stderr.write('%s - %s\n' % (self.address_string(), fmt % args))
+
+    def _send(self, code, body, content_type='text/plain; charset=utf-8'):
+        raw = body.encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(raw)))
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+        self.send_header('Pragma', 'no-cache')
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(raw)
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        parts = [p for p in parsed.path.split('/') if p]
+        if not parts:
+            self._send(404, 'not found\n')
+            return
+
+        conf = read_conf()
+        token = conf_value(conf, 'SUB_TOKEN')
+        if not token or not hmac.compare_digest(parts[0], token):
+            # same answer for "wrong token" and "no such path": nothing to probe
+            self._send(404, 'not found\n')
+            return
+
+        if len(parts) == 1:
+            self._send(404, 'not found\n')
+            return
+
+        tail = parts[1].lower()
+        if tail == 'health':
+            self._send(200, 'ok\n')
+            return
+
+        if tail not in PATH_TARGETS:
+            self._send(404, 'not found\n')
+            return
+
+        query = parse_qs(parsed.query)
+        target = (query.get('target') or [''])[0].strip().lower()
+        if not target:
+            target = PATH_TARGETS[tail]
+
+        try:
+            text, content_type = render(target)
+        except Exception as exc:                             # noqa: BLE001 - report, never crash the service
+            sys.stderr.write('render failed: %r\n' % (exc,))
+            self._send(500, 'render failed\n')
+            return
+
+        self._send(200, text, content_type)
+
+
+def main():
+    conf = read_conf()
+    port = int(conf_value(conf, 'SUB_PORT', '13357'))
+    bind = conf_value(conf, 'SUB_BIND', '127.0.0.1')
+    if not conf_value(conf, 'SUB_TOKEN'):
+        sys.stderr.write('SUB_TOKEN missing in %s\n' % CONF_PATH)
+        return 2
+    if conf_value(conf, 'SUB_ENABLED', '1') != '1':
+        sys.stderr.write('subscription disabled in %s\n' % CONF_PATH)
+        return 0
+
+    ThreadingHTTPServer.allow_reuse_address = True
+    httpd = ThreadingHTTPServer((bind, port), Handler)
+    sys.stderr.write('snell-subscription listening on %s:%d\n' % (bind, port))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+SNELLSUB_PY
+    chmod 755 "$SNELL_SUB_SVC" || return 1
+}
+
+# python3 的绝对路径（写进 unit，避免 PATH 与 systemd 不一致）
+snell_sub_python() {
+    command -v python3 2>/dev/null || true
+}
+
+# 缺 python3 时尝试装一次；装不上返回非 0，由调用方决定怎么办
+snell_sub_ensure_python() {
+    [ -n "$(snell_sub_python)" ] && return 0
+    echo -e "${YELLOW}订阅服务需要 python3，正在尝试安装...${RESET}"
+    pkg_install python3 >/dev/null 2>&1 || pkg_install python3-minimal >/dev/null 2>&1 || true
+    [ -n "$(snell_sub_python)" ] && return 0
+    echo -e "${RED}装不上 python3，订阅服务无法运行${RESET}"
+    return 1
+}
+
+snell_sub_write_unit() {
+    local python
+    python=$(snell_sub_python)
+    [ -n "$python" ] || return 1
+    cat > "$SNELL_SUB_UNIT" << EOF
+[Unit]
+Description=Snell subscription endpoint (Sub-Store remote)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=${python} ${SNELL_SUB_SVC}
+Restart=on-failure
+RestartSec=2s
+# 只读配置、不写文件系统：这个服务不落任何数据
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ReadOnlyPaths=${SNELL_CONF_DIR} ${SYSTEMD_DIR}
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${SNELL_SUB_UNIT_NAME}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$SNELL_SUB_UNIT" 2>/dev/null || true
+}
+
+snell_sub_enable() {
+    snell_sub_ensure_conf || { echo -e "${RED}生成订阅配置失败${RESET}"; return 1; }
+    snell_sub_ensure_python || return 1
+    snell_sub_write_service || { echo -e "${RED}写入 ${SNELL_SUB_SVC} 失败${RESET}"; return 1; }
+    snell_sub_write_unit || { echo -e "${RED}取不到 python3 路径${RESET}"; return 1; }
+    snell_sub_set SUB_ENABLED 1
+
+    systemctl daemon-reload 2>/dev/null || true
+    # 先 enable 再 restart：unit 或程序刚被改写过，正在跑的进程要换成新的
+    systemctl enable "$SNELL_SUB_UNIT_NAME" >/dev/null 2>&1 || true
+    systemctl restart "$SNELL_SUB_UNIT_NAME" >/dev/null 2>&1 || true
+
+    local waited=0
+    while [ "$waited" -lt 10 ]; do
+        if systemctl is-active --quiet "$SNELL_SUB_UNIT_NAME"; then
+            echo -e "${GREEN}订阅服务已启动（$(snell_sub_get SUB_BIND):$(snell_sub_get SUB_PORT)）${RESET}"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo -e "${RED}订阅服务没有起来，最近日志：${RESET}"
+    journalctl -u "$SNELL_SUB_UNIT_NAME" -n 20 --no-pager 2>/dev/null | sed 's/^/   /'
+    return 1
+}
+
+snell_sub_disable() {
+    systemctl disable --now "$SNELL_SUB_UNIT_NAME" >/dev/null 2>&1 || true
+    snell_sub_set SUB_ENABLED 0
+    echo -e "${YELLOW}订阅服务已停用。配置与链接保留，重新启用后 token 不变${RESET}"
+}
+
+snell_sub_restart() {
+    systemctl restart "$SNELL_SUB_UNIT_NAME" >/dev/null 2>&1 || {
+        echo -e "${RED}重启失败，服务可能还没启用${RESET}"
+        return 1
+    }
+    sleep 1
+    echo -e "${GREEN}订阅服务已重启${RESET}"
+}
+
+snell_sub_status() {
+    local state="未启用"
+    systemctl is-enabled --quiet "$SNELL_SUB_UNIT_NAME" 2>/dev/null && state="已启用"
+    if systemctl is-active --quiet "$SNELL_SUB_UNIT_NAME" 2>/dev/null; then
+        state="${state} / 运行中"
+    elif [ -f "$SNELL_SUB_UNIT" ]; then
+        state="${state} / 已停止"
+    fi
+
+    echo -e "${CYAN}订阅服务：${RESET}${state}"
+    [ -f "$SNELL_SUB_CONF" ] || { echo -e "${YELLOW}还没有配置，选「1」或执行 snell sub on 生成${RESET}"; return 0; }
+    echo -e "${CYAN}监听：${RESET}$(snell_sub_get SUB_BIND):$(snell_sub_get SUB_PORT)"
+    echo -e "${CYAN}节点地址：${RESET}$(snell_sub_get SUB_SERVER)"
+    echo -e "${CYAN}地区标记：${RESET}$(snell_sub_get SUB_COUNTRY)"
+    if [ -f "$SNELL_SUB_SVC" ]; then
+        echo -e "${CYAN}程序：${RESET}${SNELL_SUB_SVC}"
+    fi
+    return 0
+}
+
+# 本机可用的订阅地址（不含 token，调用方自己拼）
+snell_sub_base_url() {
+    local bind port host
+    bind=$(snell_sub_get SUB_BIND)
+    port=$(snell_sub_get SUB_PORT)
+    host="127.0.0.1"
+    if [ "$bind" != "127.0.0.1" ]; then
+        host=$(snell_sub_get SUB_SERVER)
+        [ -n "$host" ] || host="127.0.0.1"
+    fi
+    echo "http://${host}:${port}"
+}
+
+snell_sub_links() {
+    [ -f "$SNELL_SUB_CONF" ] || { snell_sub_ensure_conf || return 1; }
+    local token base
+    token=$(snell_sub_get SUB_TOKEN)
+    base=$(snell_sub_base_url)
+
+    echo
+    echo -e "${CYAN}================================${RESET}"
+    echo -e "${GREEN}订阅链接${RESET}"
+    echo -e "${CYAN}================================${RESET}"
+    echo -e "${YELLOW}Sub-Store remote / Clash（默认）${RESET}"
+    echo "  ${base}/${token}/sub?target=clash"
+    echo -e "${YELLOW}完整 Clash 配置（直接导入 Mihomo / Verge）${RESET}"
+    echo "  ${base}/${token}/sub?target=clash-full"
+    echo -e "${YELLOW}Surge（含 v6 与 ShadowTLS 节点）${RESET}"
+    echo "  ${base}/${token}/sub?target=surge"
+    echo -e "${YELLOW}base64 / JSON / 存活探测${RESET}"
+    echo "  ${base}/${token}/sub?target=base64"
+    echo "  ${base}/${token}/sub?target=json"
+    echo "  ${base}/${token}/health"
+    echo
+    echo -e "${YELLOW}链接等同凭据，别公开贴；泄露后执行 snell sub token 重置${RESET}"
+}
+
+snell_sub_store_hint() {
+    local token base
+    token=$(snell_sub_get SUB_TOKEN)
+    base=$(snell_sub_base_url)
+    echo
+    echo -e "${CYAN}Sub-Store 里新增订阅源${RESET}"
+    echo -e "  类型     ${GREEN}remote${RESET}"
+    echo -e "  名称     随意（例如 snell）"
+    echo -e "  URL      ${GREEN}${base}/${token}/sub?target=clash${RESET}"
+    echo
+    echo -e "${YELLOW}要点：不要再往这个源里填内容（content）。remote 源如果残留旧内容，"
+    echo -e "Sub-Store 会优先用内容里的旧 PSK，表现为「订阅是新的、输出是旧的」。${RESET}"
+    echo -e "${YELLOW}需要保留 Snell v6 / ShadowTLS 节点时（例如给「小火箭」这类 Surge 集合用），"
+    echo -e "URL 换成 target=surge：Surge 支持这些节点，Sub-Store 会自己按目标客户端过滤。${RESET}"
+}
+
+snell_sub_nginx_hint() {
+    local token port
+    token=$(snell_sub_get SUB_TOKEN)
+    port=$(snell_sub_get SUB_PORT)
+    echo
+    echo -e "${CYAN}nginx 反代片段（贴进已有的 HTTPS server 块）${RESET}"
+    cat << EOF
+location /snell/${token}/ {
+    proxy_pass http://127.0.0.1:${port}/${token}/;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_read_timeout 30s;
+    add_header Cache-Control "no-store" always;
+}
+EOF
+    echo -e "${YELLOW}反代后：https://你的域名/snell/${token}/sub?target=clash${RESET}"
+}
+
+# 自检：逐个目标请求一次本机端点，看到节点数和关键字段
+snell_sub_check() {
+    [ -f "$SNELL_SUB_CONF" ] || { echo -e "${RED}还没有订阅配置${RESET}"; return 1; }
+    systemctl is-active --quiet "$SNELL_SUB_UNIT_NAME" 2>/dev/null || {
+        echo -e "${RED}服务没在运行，先 snell sub on${RESET}"
+        return 1
+    }
+    local token base url code body count failed=0
+    token=$(snell_sub_get SUB_TOKEN)
+    base=$(snell_sub_base_url)
+
+    for target in clash clash-full surge base64 json; do
+        url="${base}/${token}/sub?target=${target}"
+        code=$(curl -s -o /tmp/snell-sub-check.$$ -w '%{http_code}' --max-time 10 "$url" 2>/dev/null)
+        case "$target" in
+            clash)      count=$(grep -c '^    type: snell' /tmp/snell-sub-check.$$ 2>/dev/null) ;;
+            clash-full) count=$(grep -c '^    type: snell' /tmp/snell-sub-check.$$ 2>/dev/null) ;;
+            surge)      count=$(grep -c ' = snell,' /tmp/snell-sub-check.$$ 2>/dev/null) ;;
+            base64)     count=$(base64 -d < /tmp/snell-sub-check.$$ 2>/dev/null | grep -c ' = snell,') ;;
+            json)       count=$(grep -c '"type": "snell"' /tmp/snell-sub-check.$$ 2>/dev/null) ;;
+        esac
+        [ -n "$count" ] || count=0
+        if [ "$code" = "200" ]; then
+            echo -e "  ${GREEN}OK${RESET}   ${target}   HTTP ${code}   ${count} 个节点"
+        else
+            echo -e "  ${RED}FAIL${RESET} ${target}   HTTP ${code}"
+            failed=1
+        fi
+    done
+    rm -f /tmp/snell-sub-check.$$
+
+    local health
+    health=$(curl -s --max-time 5 "${base}/${token}/health" 2>/dev/null)
+    if [ "$health" = "ok" ]; then
+        echo -e "  ${GREEN}OK${RESET}   health    HTTP 200"
+    else
+        echo -e "  ${RED}FAIL${RESET} health"
+        failed=1
+    fi
+    return $failed
+}
+
+# 卸载时一并清掉订阅服务
+snell_sub_cleanup() {
+    if [ -f "$SNELL_SUB_UNIT" ] || systemctl list-unit-files 2>/dev/null | grep -q "^${SNELL_SUB_UNIT_NAME}\."; then
+        echo -e "${YELLOW}正在移除订阅服务${RESET}"
+        systemctl disable --now "$SNELL_SUB_UNIT_NAME" >/dev/null 2>&1 || true
+        rm -f "$SNELL_SUB_UNIT" "$SNELL_SUB_SVC"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    rm -f "$SNELL_SUB_SVC" "$SNELL_SUB_CONF" 2>/dev/null || true
+    return 0
+}
+
+# 安装流程末尾调用：装了就把订阅服务拉起来。失败只告警，不影响 Snell 本体
+snell_sub_install_silent() {
+    [ -f "$SNELL_CONF_FILE" ] || return 0
+    if ! snell_sub_ensure_python; then
+        echo -e "${YELLOW}跳过订阅服务（没有 python3）。装好后可以执行 snell sub on 再试${RESET}"
+        return 0
+    fi
+    if snell_sub_enable; then
+        snell_sub_links
+    else
+        echo -e "${YELLOW}订阅服务没能启动，Snell 本体的安装不受影响；可稍后执行 snell sub on 重试${RESET}"
+    fi
+    return 0
+}
+
+snell_sub_menu() {
+    local choice
+    while true; do
+        echo
+        echo -e "${CYAN}========== 订阅服务（Sub-Store / Clash） ==========${RESET}"
+        echo -e "  ${GREEN}1.${RESET} 查看订阅链接 / 启用服务"
+        echo -e "  ${GREEN}2.${RESET} 停用服务"
+        echo -e "  ${GREEN}3.${RESET} 重启服务"
+        echo -e "  ${GREEN}4.${RESET} 服务状态"
+        echo -e "  ${GREEN}5.${RESET} 自检（逐个目标请求一次）"
+        echo -e "  ${GREEN}6.${RESET} Sub-Store remote 源怎么填"
+        echo -e "  ${GREEN}7.${RESET} nginx 反代片段（公网 HTTPS）"
+        echo -e "  ${GREEN}8.${RESET} 重置 token"
+        echo -e "  ${GREEN}9.${RESET} 修改订阅端口"
+        echo -e "  ${GREEN}10.${RESET} 设置节点地址 / 地区标记"
+        echo -e "  ${GREEN}11.${RESET} 切换公网监听 / 仅本机"
+        echo -e "  ${GREEN}0.${RESET} 返回主菜单"
+        if ! read -rp "  请选择: " choice; then return 0; fi
+        case "$choice" in
+            1)  snell_sub_ensure_conf && snell_sub_enable && snell_sub_links ;;
+            2)  snell_sub_disable ;;
+            3)  snell_sub_restart ;;
+            4)  snell_sub_status ;;
+            5)  snell_sub_check ;;
+            6)  snell_sub_store_hint ;;
+            7)  snell_sub_nginx_hint ;;
+            8)  snell_sub_reset_token ;;
+            9)  snell_sub_change_port ;;
+            10) snell_sub_change_server ;;
+            11) snell_sub_toggle_bind ;;
+            0)  return 0 ;;
+            *)  echo -e "${RED}请输入正确的选项${RESET}" ;;
+        esac
+        echo
+        read -rp "  按回车继续..." _ || return 0
+    done
+}
+
+snell_sub_reset_token() {
+    snell_sub_ensure_conf || return 1
+    snell_sub_set SUB_TOKEN "$(snell_sub_token_new)"
+    echo -e "${GREEN}已重置 token（服务每次请求重读配置，不用重启）${RESET}"
+    echo -e "${YELLOW}Sub-Store 里的旧 URL 会立刻失效，记得同步更新${RESET}"
+    snell_sub_links
+}
+
+snell_sub_change_port() {
+    snell_sub_ensure_conf || return 1
+    local new_port
+    read -rp "  新的订阅端口（当前 $(snell_sub_get SUB_PORT)）: " new_port
+    case "$new_port" in
+        ''|*[!0-9]*) echo -e "${RED}端口必须是数字${RESET}"; return 1 ;;
+    esac
+    if [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
+        echo -e "${RED}端口范围是 1-65535${RESET}"
+        return 1
+    fi
+    snell_sub_set SUB_PORT "$new_port"
+    snell_sub_restart || return 1
+    snell_sub_links
+}
+
+snell_sub_change_server() {
+    snell_sub_ensure_conf || return 1
+    local addr country
+    read -rp "  节点地址（IP 或域名，当前 $(snell_sub_get SUB_SERVER)）: " addr
+    if [ -n "$addr" ]; then
+        snell_sub_set SUB_SERVER "$addr"
+        country=$(get_ip_country "$addr" 2>/dev/null)
+        case "$country" in
+            [A-Z][A-Z]) snell_sub_set SUB_COUNTRY "$country"; echo -e "${GREEN}已识别地区：${country}${RESET}" ;;
+        esac
+    fi
+    read -rp "  地区标记（节点名前缀，例如 US，留空不改）: " country
+    [ -n "$country" ] && snell_sub_set SUB_COUNTRY "$country"
+    echo -e "${GREEN}已更新，服务下次请求即生效${RESET}"
+}
+
+snell_sub_toggle_bind() {
+    snell_sub_ensure_conf || return 1
+    local current
+    current=$(snell_sub_get SUB_BIND)
+    if [ "$current" = "127.0.0.1" ]; then
+        snell_sub_set SUB_BIND "0.0.0.0"
+        open_port "$(snell_sub_get SUB_PORT)" TCP 2>/dev/null || true
+        snell_sub_restart
+        echo -e "${YELLOW}已改为公网监听，确认防火墙只放行这个端口，且不要泄露 token${RESET}"
+    else
+        snell_sub_set SUB_BIND "127.0.0.1"
+        snell_sub_restart
+        echo -e "${GREEN}已改回仅本机监听；同机的 Sub-Store 不受影响${RESET}"
+    fi
+    snell_sub_links
+}
+
+# 非交互入口：snell sub <动作>
+snell_sub_cli() {
+    local action="${1:-show}" arg="${2:-}"
+    case "$action" in
+        show|"")        snell_sub_links ;;
+        on|enable)      snell_sub_ensure_conf && snell_sub_enable && snell_sub_links ;;
+        off|disable)    snell_sub_disable ;;
+        restart)        snell_sub_restart ;;
+        status)         snell_sub_status ;;
+        check|test)     snell_sub_check ;;
+        store|remote)   snell_sub_store_hint ;;
+        nginx)          snell_sub_nginx_hint ;;
+        token)          snell_sub_reset_token ;;
+        port)           snell_sub_change_port ;;
+        server)         snell_sub_change_server ;;
+        public)         snell_sub_set SUB_BIND 0.0.0.0 && snell_sub_restart && snell_sub_links ;;
+        local|private)  snell_sub_set SUB_BIND 127.0.0.1 && snell_sub_restart && snell_sub_links ;;
+        menu)           snell_sub_menu ;;
+        -h|--help|help)
+            echo "用法：snell sub [show|on|off|restart|status|check|store|nginx|token|port|server|public|local|menu]"
+            ;;
+        *)
+            echo -e "${RED}未知动作：${action}${RESET}"
+            echo "用法：snell sub [show|on|off|restart|status|check|store|nginx|token|port|server|public|local|menu]"
+            return 1
+            ;;
+    esac
+}

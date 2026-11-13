@@ -17,9 +17,10 @@ SNELL_LIB="${SNELL_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib}"  # @
 . "$SNELL_LIB/channels.sh"  # @bundle
 . "$SNELL_LIB/conf.sh"      # @bundle
 . "$SNELL_LIB/routing.sh"   # @bundle
+. "$SNELL_LIB/subscription.sh"  # @bundle
 
 #当前版本号
-current_version="6.3"
+current_version="6.4"
 
 # 出口控制（netns + socket activation）默认参数
 EGRESS_FEATURE_ENABLED="false"
@@ -612,8 +613,7 @@ start_egress_runtime() {
 }
 
 # 安装 Snell
-# 写管理命令 /usr/local/bin/snell：每次运行都经短域名取最新脚本（地址由 Cloudflare 重定向，
-# 脚本在仓库里换位置也不用改这里）
+# 写管理命令 /usr/local/bin/snell：每次运行都取最新脚本
 write_management_script() {
     mkdir -p /usr/local/bin
     cat > /usr/local/bin/snell << 'EOFSCRIPT'
@@ -635,7 +635,7 @@ fi
 # 下载并执行最新版本的脚本（带完整性校验：传输失败即停、非空、语法检查）
 echo -e "${CYAN}正在获取最新版本的管理脚本...${RESET}"
 TMP_SCRIPT=$(mktemp)
-if curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 https://snell.jinqians.com -o "$TMP_SCRIPT" \
+if curl -fsSL --retry 2 --connect-timeout 10 --max-time 60 SNELL_SCRIPT_URL_PLACEHOLDER -o "$TMP_SCRIPT" \
     && [ -s "$TMP_SCRIPT" ] && bash -n "$TMP_SCRIPT" 2>/dev/null; then
     bash "$TMP_SCRIPT"
     rm -f "$TMP_SCRIPT"
@@ -645,15 +645,18 @@ else
     exit 1
 fi
 EOFSCRIPT
+    # 地址来自 common.sh 的 SNELL_SCRIPT_URL（可被环境变量覆盖），写进 heredoc 时替换
+    sed -i "s|SNELL_SCRIPT_URL_PLACEHOLDER|${SNELL_SCRIPT_URL}|" /usr/local/bin/snell
     chmod +x /usr/local/bin/snell
 }
 
 # 旧版写的管理命令直连 raw.githubusercontent.com 上的固定路径（snell.sh / snell-centos.sh），
-# 换成走短域名的新写法；不是本脚本写的文件不动。仓库改名前叫 jinqians/snell.sh，两个名字都认
+# 换成每次取最新脚本的新写法；不是本脚本写的文件不动。仓库改名前叫 jinqians/snell.sh，
+# 上游的地址也一并认（fork 之前装过的机器升级上来时同样是旧写法）
 upgrade_management_script() {
     [ -f /usr/local/bin/snell ] || return 0
-    grep -qE 'raw\.githubusercontent\.com/jinqians/snell(\.sh)?/' /usr/local/bin/snell 2>/dev/null || return 0
-    write_management_script && echo -e "${GREEN}已更新 snell 管理命令（改为经 snell.jinqians.com 获取最新脚本）${RESET}"
+    grep -qE 'raw\.githubusercontent\.com/(jinqians|helloktity)/snell(\.sh)?/|snell\.jinqians\.com' /usr/local/bin/snell 2>/dev/null || return 0
+    write_management_script && echo -e "${GREEN}已更新 snell 管理命令（改为每次获取最新脚本）${RESET}"
 }
 
 # 读主配置里 key = value 的值（取第一个 = 之后的全部，base64 PSK 里的 = 不会被截掉）
@@ -900,6 +903,9 @@ install_snell() {
         echo -e "\n${RED}创建管理脚本失败。${RESET}"
         echo -e "${YELLOW}您可以通过直接运行原脚本来管理 Snell。${RESET}\n"
     fi
+
+    # 订阅服务：装上就给一条订阅链接（失败只告警，不影响 Snell 本体）
+    snell_sub_install_silent
 }
 
 # 已安装 Snell v5/v6 的出口控制管理
@@ -1015,6 +1021,9 @@ uninstall_snell() {
 
     # 规则分流（sing-box）一起删掉：拦截规则、服务、配置
     router_remove
+
+    # 订阅服务一起删掉（unit 里的程序与配置在 ${SNELL_CONF_DIR} 里，后面会整体删除）
+    snell_sub_cleanup
 
     # 停止并删除依赖 Snell 后端的 ShadowTLS 服务，避免留下无后端的监听服务
     local snell_shadowtls_services
@@ -1480,9 +1489,21 @@ view_snell_config() {
         done <<< "$snell_services"
     fi
     
+    # 订阅链接已启用就顺手显示，省得再去菜单里找
+    if [ -f "$SNELL_SUB_CONF" ]; then
+        local sub_token sub_base
+        sub_token=$(snell_sub_get SUB_TOKEN)
+        sub_base=$(snell_sub_base_url)
+        echo -e "\n${YELLOW}=== 订阅链接（Sub-Store remote / Clash / Surge） ===${RESET}"
+        echo "  clash : ${sub_base}/${sub_token}/sub?target=clash"
+        echo "  surge : ${sub_base}/${sub_token}/sub?target=surge"
+        echo -e "${CYAN}  更多目标与自检：主菜单 14，或执行 snell sub${RESET}"
+    fi
+
     echo -e "\n${YELLOW}注意：${RESET}"
-    echo -e "1. Snell 仅支持 Surge 客户端"
+    echo -e "1. Snell 原生是 Surge 协议；Mihomo / Clash Verge 也支持 v4 / v5（v6 与 ShadowTLS 目前只有 Surge 能用）"
     echo -e "2. 请将配置中的服务器地址替换为实际可用的地址"
+    echo -e "3. 需要订阅链接时用主菜单「14. 订阅」，或执行 snell sub"
     read -p "按任意键返回主菜单..."
 }
 
@@ -2302,7 +2323,7 @@ show_menu() {
     local thin="──────────────────────────────────────────────────────────────"
     local rule="──────────────────────────────────────────────"
     local items=("安装 Snell" "卸载 Snell" "查看配置" "修改端口 / PSK / DNS" "多用户管理" "版本管理（v4/v5/v6）" "重启服务"
-                 "服务状态" "ShadowTLS" "BBR" "规则分流（sing-box）" "出口控制（v5/v6）" "更新脚本")
+                 "服务状态" "ShadowTLS" "BBR" "规则分流（sing-box）" "出口控制（v5/v6）" "更新脚本" "订阅（Sub-Store / Clash）")
     local rows=7 i k w=0 line
     clear 2>/dev/null || true
     echo
@@ -2365,6 +2386,14 @@ setup_shadowtls() {
     sleep 1  # 给用户一点时间看到提示
 }
 
+# 非交互入口：snell sub [show|on|off|restart|status|check|store|nginx|token|port|server|public|local|menu]
+# 放在主循环之前，脚本其余行为不变（不带参数仍然是交互菜单）
+if [ "${1:-}" = "sub" ]; then
+    shift
+    snell_sub_cli "$@"
+    exit $?
+fi
+
 # 主循环
 while true; do
     show_menu
@@ -2382,12 +2411,13 @@ while true; do
         11) router_menu ;;
         12) configure_v5_egress_control ;;
         13) update_script ;;
+        14) snell_sub_menu ;;
         0)
             echo -e "${GREEN}感谢使用，再见！${RESET}"
             exit 0
             ;;
         *)
-            echo -e "${RED}请输入正确的选项 [0-13]${RESET}"
+            echo -e "${RED}请输入正确的选项 [0-14]${RESET}"
             ;;
     esac
     echo -e "\n${CYAN}按任意键返回主菜单...${RESET}"

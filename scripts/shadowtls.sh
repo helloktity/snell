@@ -19,16 +19,17 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 RESET='\033[0m'
 
-# 脚本的发布地址。短域名（*.jinqians.com）由 Cloudflare 重定向到仓库里的文件：
-# snell / snell-centos / snell-alpine → 根目录，menu / snell-docker / install → scripts/。
-# 菜单里调用的子脚本从 SNELL_RAW_BASE 下的 scripts/、docker/ 取。
-# 脚本自身的更新与管理命令走短域名，运行才会被统计到。
+# 脚本的发布地址。默认指向本仓库（helloktity/snell，从上游 jinqians/snell fork
+# 而来）：下面这些地址决定「菜单拉哪个子脚本」「snell 命令自动更新到哪个版本」，
+# 指向上游的话，本仓库的改动（比如订阅服务）不会生效。
+# 上游用 *.jinqians.com 的短域名做跳转 + 访问统计，fork 没有这些域名，直接用 raw。
 # 可以用同名环境变量换成镜像地址（测试时指向本地的文件）。
-SNELL_RAW_BASE="${SNELL_RAW_BASE:-https://raw.githubusercontent.com/jinqians/snell/main}"
-SNELL_SCRIPT_URL="${SNELL_SCRIPT_URL:-https://snell.jinqians.com}"                     # snell.sh（Debian / Ubuntu / CentOS / RHEL）
-SNELL_ALPINE_SCRIPT_URL="${SNELL_ALPINE_SCRIPT_URL:-https://snell-alpine.jinqians.com}" # snell-alpine.sh
-SNELL_DOCKER_SCRIPT_URL="${SNELL_DOCKER_SCRIPT_URL:-https://snell-docker.jinqians.com}" # snell-docker.sh
-SNELL_MENU_SCRIPT_URL="${SNELL_MENU_SCRIPT_URL:-https://menu.jinqians.com}"             # menu.sh
+SNELL_REPO="${SNELL_REPO:-helloktity/snell}"
+SNELL_RAW_BASE="${SNELL_RAW_BASE:-https://raw.githubusercontent.com/${SNELL_REPO}/main}"
+SNELL_SCRIPT_URL="${SNELL_SCRIPT_URL:-${SNELL_RAW_BASE}/snell.sh}"                       # snell.sh（Debian / Ubuntu / CentOS / RHEL）
+SNELL_ALPINE_SCRIPT_URL="${SNELL_ALPINE_SCRIPT_URL:-${SNELL_RAW_BASE}/snell-alpine.sh}"   # snell-alpine.sh
+SNELL_DOCKER_SCRIPT_URL="${SNELL_DOCKER_SCRIPT_URL:-${SNELL_RAW_BASE}/scripts/snell-docker.sh}" # snell-docker.sh
+SNELL_MENU_SCRIPT_URL="${SNELL_MENU_SCRIPT_URL:-${SNELL_RAW_BASE}/scripts/menu.sh}"       # menu.sh
 
 # 检查是否以 root 权限运行
 check_root() {

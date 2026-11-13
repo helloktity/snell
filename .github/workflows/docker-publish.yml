@@ -28,7 +28,9 @@ on:
       - "v*"
 
 env:
-  IMAGE_NAME: jinqians/snell-server
+  # 用仓库属主而不是写死的上游账号：fork 之后自动变成 <你的用户名>/snell-server，
+  # 配上自己的 Docker Hub 凭据就能推到自己的镜像下
+  IMAGE_NAME: ${{ github.repository_owner }}/snell-server
   SHADOWTLS_VERSION: v0.2.25
   # latest 标签跟随哪个通道
   LATEST_CHANNEL: v5
