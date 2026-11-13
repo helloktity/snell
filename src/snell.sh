@@ -20,7 +20,7 @@ SNELL_LIB="${SNELL_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib}"  # @
 . "$SNELL_LIB/subscription.sh"  # @bundle
 
 #当前版本号
-current_version="6.5"
+current_version="6.6"
 
 # 出口控制（netns + socket activation）默认参数
 EGRESS_FEATURE_ENABLED="false"
