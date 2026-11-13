@@ -60,7 +60,10 @@ Sub-Store 可以像订阅 3x-ui 那样用 `source=remote` 订阅本机，Mihomo 
 - 配置在 `/etc/snell/.subscription`（600），40 位 token 写在路径里；
   链接等同凭据，泄露后 `snell sub token` 重置。
 - 默认只监听 `127.0.0.1`（同机 Sub-Store 够用）。要给外网用：`snell sub public`
-  直接开公网监听，或保持仅本机 + `snell sub nginx` 拿到反代片段。
+  —— 自动在 nginx 443 上反代并复用现有证书，只出 HTTPS 链接，**不提供明文 HTTP**。
+  只想要片段自己贴：`snell sub nginx-hint`。
+- 与 Mieru-Plus 共用 `/etc/nginx/conf.d/50-subscription.conf` 这一个 vhost，
+  各自往 `/etc/nginx/snippets/subscription/` 写 location 片段，不会互相顶掉。
 - 实现是纯 python3 标准库的 HTTP 服务，不需要 pip；没有 python3 时只跳过订阅，不影响 Snell 本体。
 
 ```bash
@@ -70,10 +73,10 @@ snell sub restart        # 重启
 snell sub status         # 状态
 snell sub check          # 自检：逐个目标请求一次本机端点
 snell sub store          # Sub-Store 里怎么填
-snell sub nginx          # nginx 反代片段
+snell sub nginx          # 自动配置公网 HTTPS（nginx 443 + 现有证书）
 snell sub token          # 重置 token
 snell sub port | server  # 改订阅端口 / 节点地址
-snell sub public | local # 公网监听 / 仅本机
+snell sub public | local # 开 / 关公网 HTTPS（不再有明文监听）
 ```
 
 Sub-Store 里新增订阅源：类型选 `remote`，URL 填 `<base>/sub?target=clash`。

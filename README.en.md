@@ -63,8 +63,11 @@ Notes:
 - Config lives in `/etc/snell/.subscription` (600), the 40-char token is part of the path.
   The link is a credential: `snell sub token` rotates it.
 - Listens on `127.0.0.1` only by default (enough for Sub-Store on the same host).
-  For external access use `snell sub public`, or keep it local and take the
-  `snell sub nginx` reverse-proxy snippet.
+  For external access run `snell sub public`: it auto-configures an nginx reverse proxy on
+  port 443 reusing the machine's existing certificate and only emits HTTPS links — plain HTTP
+  is not offered. Want the snippet instead? `snell sub nginx-hint`.
+- Shares a single `/etc/nginx/conf.d/50-subscription.conf` vhost with Mieru-Plus; each script
+  drops its own location snippet under `/etc/nginx/snippets/subscription/`.
 - Pure python3 standard library, no pip. Without python3 only the subscription is skipped.
 
 ```bash

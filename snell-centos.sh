@@ -2235,6 +2235,7 @@ SNELL_SUB_SVC="${INSTALL_DIR}/snell-subscription"
 SNELL_SUB_UNIT="${SYSTEMD_DIR}/snell-subscription.service"
 SNELL_SUB_UNIT_NAME="snell-subscription"
 SNELL_SUB_PORT_DEFAULT="13357"
+SNELL_SUB_NGINX_CONF="/etc/nginx/snippets/subscription/snell.conf"
 
 # 读配置里某个键的值
 snell_sub_get() {   # <key>
@@ -2964,27 +2965,33 @@ snell_sub_status() {
 
 # 本机可用的订阅地址（不含 token，调用方自己拼）
 snell_sub_base_url() {
-    local bind port host
-    bind=$(snell_sub_get SUB_BIND)
-    port=$(snell_sub_get SUB_PORT)
-    host="127.0.0.1"
-    if [ "$bind" != "127.0.0.1" ]; then
-        host=$(snell_sub_get SUB_SERVER)
-        [ -n "$host" ] || host="127.0.0.1"
-    fi
-    echo "http://${host}:${port}"
+    # 订阅服务只监听回环；公网一律经 nginx 走 HTTPS，这里不出明文公网地址
+    echo "http://127.0.0.1:$(snell_sub_get SUB_PORT)"
 }
 
 snell_sub_links() {
     [ -f "$SNELL_SUB_CONF" ] || { snell_sub_ensure_conf || return 1; }
-    local token base
+    local token base pub
     token=$(snell_sub_get SUB_TOKEN)
     base=$(snell_sub_base_url)
+    pub=$(snell_sub_public_url 2>/dev/null) || pub=""
 
     echo
     echo -e "${CYAN}================================${RESET}"
     echo -e "${GREEN}订阅链接${RESET}"
     echo -e "${CYAN}================================${RESET}"
+    if [ -n "$pub" ]; then
+        echo -e "${YELLOW}公网 HTTPS（外部客户端 / 其它机器上的 Sub-Store）${RESET}"
+        echo "  ${pub}/sub?target=clash"
+        echo "  ${pub}/sub?target=surge"
+        echo "  ${pub}/health"
+        echo
+        echo -e "${YELLOW}本机（回环不出网，同机 Sub-Store 用）${RESET}"
+    else
+        echo -e "${YELLOW}当前只有本机链接（外部不可用）${RESET}"
+        echo -e "${YELLOW}开公网 HTTPS：snell sub public${RESET}"
+        echo -e "${YELLOW}本机（回环不出网）${RESET}"
+    fi
     echo -e "${YELLOW}Sub-Store remote / Clash（默认）${RESET}"
     echo "  ${base}/${token}/sub?target=clash"
     echo -e "${YELLOW}完整 Clash 配置（直接导入 Mihomo / Verge）${RESET}"
@@ -3013,6 +3020,199 @@ snell_sub_store_hint() {
     echo -e "Sub-Store 会优先用内容里的旧 PSK，表现为「订阅是新的、输出是旧的」。${RESET}"
     echo -e "${YELLOW}需要保留 Snell v6 / ShadowTLS 节点时（例如给「小火箭」这类 Surge 集合用），"
     echo -e "URL 换成 target=surge：Surge 支持这些节点，Sub-Store 会自己按目标客户端过滤。${RESET}"
+}
+
+# ──────────── 公网 HTTPS 订阅（不需要手工改 nginx） ────────────
+# 订阅服务永久只监听 127.0.0.1，公网一律经 nginx 在 443 上反代；
+# 域名默认 <IP 横线形式>.sslip.io，证书复用机器上现成的那份。
+
+snell_sub_port_is_nginx() {   # <port>：空闲或仅被 nginx 占用即可复用
+    local pids p
+    pids=$(ss -lntpH "sport = :$1" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+    [ -z "$pids" ] && return 0
+    for p in $pids; do
+        [ "$(ps -o comm= -p "$p" 2>/dev/null | tr -d ' ')" = "nginx" ] || return 1
+    done
+    return 0
+}
+
+snell_sub_cert_match() {   # <cert> <host>
+    [ -s "$1" ] || return 1
+    command -v openssl >/dev/null 2>&1 || return 0
+    openssl x509 -in "$1" -noout -checkhost "$2" 2>/dev/null | grep -q 'does match'
+}
+
+# 输出 "host|cert|key"；失败返回 1
+snell_sub_detect_tls() {
+    local ip domain d cert key
+    ip=$(snell_sub_get SUB_SERVER)
+    [ -n "$ip" ] || ip=$(get_public_ipv4 2>/dev/null)
+    [ -n "$ip" ] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+    domain=$(snell_sub_get SUB_DOMAIN)
+    [ -n "$domain" ] || domain="${ip//./-}.sslip.io"
+
+    local dirs="" x
+    while IFS= read -r x; do
+        [ -n "$x" ] && dirs="$dirs $(dirname "$x")"
+    done < <(nginx -T 2>/dev/null | awk '/ssl_certificate /{print $2}' | tr -d ';' | sort -u)
+    dirs="$dirs /root/cert/domain /root/cert/ip /etc/nginx/certs /etc/ssl/snell /etc/pki/tls/snell"
+
+    for d in $dirs; do
+        cert="$d/fullchain.pem"; key="$d/privkey.pem"
+        [ -f "$cert" ] && [ -f "$key" ] || continue
+        if snell_sub_cert_match "$cert" "$domain"; then echo "${domain}|${cert}|${key}"; return 0; fi
+        if snell_sub_cert_match "$cert" "$ip"; then echo "${ip}|${cert}|${key}"; return 0; fi
+    done
+    for d in $dirs; do
+        cert="$d/fullchain.pem"; key="$d/privkey.pem"
+        [ -f "$cert" ] && [ -f "$key" ] && { echo "${domain}|${cert}|${key}"; return 0; }
+    done
+    return 1
+}
+
+snell_sub_nginx_vhost_path()  { echo "/etc/nginx/conf.d/50-subscription.conf"; }
+snell_sub_nginx_snippet_dir() { echo "/etc/nginx/snippets/subscription"; }
+
+# mieru 与 snell 共用 443 上同一个域名，各自建 server 会被 nginx 判为
+# conflicting server name 并忽略后者；所以统一一个 vhost + include 目录。
+snell_sub_nginx_apply() {   # [port]
+    [ -f "$SNELL_SUB_CONF" ] || snell_sub_ensure_conf || return 1
+    command -v nginx >/dev/null 2>&1 || {
+        echo -e "${YELLOW}没装 nginx，无法自动配 HTTPS。可以用 snell sub nginx 打印片段自行配置${RESET}"
+        return 1
+    }
+    [ -d /etc/nginx/conf.d ] || { echo -e "${YELLOW}没有 /etc/nginx/conf.d，跳过自动 HTTPS${RESET}"; return 1; }
+
+    local token port https_port picked host cert key suffix vhost sdir alt
+    token=$(snell_sub_get SUB_TOKEN)
+    port=$(snell_sub_get SUB_PORT)
+    https_port=${1:-$(snell_sub_get SUB_HTTPS_PORT)}
+    [ -n "$https_port" ] || https_port=443
+
+    if ! snell_sub_port_is_nginx "$https_port"; then
+        alt=$(nginx -T 2>/dev/null | grep -oE 'listen[[:space:]]+[0-9]+[[:space:]]+ssl' | grep -oE '[0-9]+' | head -1)
+        if [ -n "$alt" ]; then
+            echo -e "${YELLOW}端口 ${https_port} 被其它程序占用，改挂 nginx 现有 HTTPS 端口 ${alt}${RESET}"
+            https_port=$alt
+        else
+            echo -e "${RED}端口 ${https_port} 被占用，且没有可复用的 nginx HTTPS 端口${RESET}"
+            return 1
+        fi
+    fi
+
+    picked=$(snell_sub_detect_tls) || {
+        echo -e "${RED}没找到可用证书（fullchain.pem / privkey.pem），无法启用 HTTPS${RESET}"
+        echo -e "${YELLOW}申请证书后再执行：snell sub nginx${RESET}"
+        return 1
+    }
+    host=${picked%%|*}; picked=${picked#*|}
+    cert=${picked%%|*}; key=${picked#*|}
+
+    vhost=$(snell_sub_nginx_vhost_path)
+    sdir=$(snell_sub_nginx_snippet_dir)
+    mkdir -p "$sdir"
+
+    # 老版本（v6.4）留下的是独立 server 块，与新 vhost 同名冲突，清掉
+    rm -f /etc/nginx/conf.d/50-snell-sub.conf
+
+    if [ ! -f "$vhost" ]; then
+        cat > "$vhost" <<NGINXEOF
+# 订阅服务共享 vhost（mieru / snell 共用，由脚本生成，勿手改）
+# 各服务只往该目录写自己的 location 片段
+server {
+    listen ${https_port} ssl;
+    server_name ${host};
+
+    ssl_certificate     ${cert};
+    ssl_certificate_key ${key};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SubVhost:1m;
+    ssl_session_timeout 10m;
+
+    access_log /var/log/nginx/subscription.log;
+    server_tokens off;
+
+    include ${sdir}/*.conf;
+
+    location / { return 404; }
+}
+NGINXEOF
+    fi
+
+    cat > "$SNELL_SUB_NGINX_CONF" <<NGINXEOF
+# 由 snell 脚本生成（snell sub nginx）—— 重新生成会覆盖本文件
+# 订阅服务监听 127.0.0.1:${port}；HTTPS 由共享 vhost 统一提供
+location /snell/${token}/ {
+    proxy_pass http://127.0.0.1:${port}/${token}/;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_read_timeout 30s;
+    add_header Cache-Control "no-store" always;
+}
+NGINXEOF
+
+    if ! nginx -t >/tmp/snell-sub-nginx.log 2>&1; then
+        echo -e "${RED}nginx 配置校验失败，已回滚${RESET}"
+        tail -5 /tmp/snell-sub-nginx.log | sed 's/^/     /'
+        rm -f "$SNELL_SUB_NGINX_CONF" /tmp/snell-sub-nginx.log
+        return 1
+    fi
+    rm -f /tmp/snell-sub-nginx.log
+
+    systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1 || {
+        echo -e "${RED}nginx 重载失败${RESET}"; return 1
+    }
+    open_port "$https_port" TCP >/dev/null 2>&1 || true
+
+    suffix=""
+    [ "$https_port" != "443" ] && suffix=":${https_port}"
+    snell_sub_set SUB_HTTPS_PORT "$https_port"
+    snell_sub_set SUB_PUBLIC "https://${host}${suffix}/snell/${token}"
+    echo -e "${GREEN}公网 HTTPS 已就绪：https://${host}${suffix}/snell/<token>/sub?target=clash${RESET}"
+    echo -e "${CYAN}片段：${SNELL_SUB_NGINX_CONF}（共享 vhost ${vhost}，证书 ${cert}，端口 ${https_port}）${RESET}"
+    return 0
+}
+
+snell_sub_nginx_off() {
+    local vhost sdir
+    vhost=$(snell_sub_nginx_vhost_path)
+    sdir=$(snell_sub_nginx_snippet_dir)
+    if [ ! -f "$SNELL_SUB_NGINX_CONF" ]; then
+        echo -e "${CYAN}没有自动配置的公网片段${RESET}"
+        return 0
+    fi
+    rm -f "$SNELL_SUB_NGINX_CONF"
+    if [ -d "$sdir" ] && ! ls "$sdir"/*.conf >/dev/null 2>&1; then
+        rm -f "$vhost"
+    fi
+    nginx -t >/dev/null 2>&1 && { systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1; }
+    snell_sub_set SUB_PUBLIC ""
+    echo -e "${GREEN}已关闭公网 HTTPS（订阅服务本身不变）${RESET}"
+}
+
+snell_sub_public_url() {
+    local pub
+    pub=$(snell_sub_get SUB_PUBLIC)
+    [ -n "$pub" ] || return 1
+    [ -f "$SNELL_SUB_NGINX_CONF" ] || return 1
+    echo "$pub"
+}
+
+snell_sub_do_public() {
+    snell_sub_ensure_conf || return 1
+    snell_sub_nginx_apply || return 1
+    snell_sub_links
+}
+
+snell_sub_do_local() {
+    snell_sub_nginx_off
+    snell_sub_set SUB_BIND "127.0.0.1"
+    snell_sub_restart >/dev/null 2>&1 || true
+    snell_sub_links
 }
 
 snell_sub_nginx_hint() {
@@ -3086,6 +3286,10 @@ snell_sub_cleanup() {
         systemctl daemon-reload 2>/dev/null || true
     fi
     rm -f "$SNELL_SUB_SVC" "$SNELL_SUB_CONF" 2>/dev/null || true
+    if [ -f "$SNELL_SUB_NGINX_CONF" ]; then
+        rm -f "$SNELL_SUB_NGINX_CONF"
+        nginx -t >/dev/null 2>&1 && { systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1; }
+    fi
     return 0
 }
 
@@ -3097,6 +3301,7 @@ snell_sub_install_silent() {
         return 0
     fi
     if snell_sub_enable; then
+        snell_sub_nginx_apply >/dev/null 2>&1 || true
         snell_sub_links
     else
         echo -e "${YELLOW}订阅服务没能启动，Snell 本体的安装不受影响；可稍后执行 snell sub on 重试${RESET}"
@@ -3115,11 +3320,11 @@ snell_sub_menu() {
         echo -e "  ${GREEN}4.${RESET} 服务状态"
         echo -e "  ${GREEN}5.${RESET} 自检（逐个目标请求一次）"
         echo -e "  ${GREEN}6.${RESET} Sub-Store remote 源怎么填"
-        echo -e "  ${GREEN}7.${RESET} nginx 反代片段（公网 HTTPS）"
+        echo -e "  ${GREEN}7.${RESET} 公网 HTTPS（自动 nginx，装完默认已配）"
         echo -e "  ${GREEN}8.${RESET} 重置 token"
         echo -e "  ${GREEN}9.${RESET} 修改订阅端口"
         echo -e "  ${GREEN}10.${RESET} 设置节点地址 / 地区标记"
-        echo -e "  ${GREEN}11.${RESET} 切换公网监听 / 仅本机"
+        echo -e "  ${GREEN}11.${RESET} 开 / 关公网 HTTPS（仅本机 ↔ 公网）"
         echo -e "  ${GREEN}0.${RESET} 返回主菜单"
         if ! read -rp "  请选择: " choice; then return 0; fi
         case "$choice" in
@@ -3129,7 +3334,7 @@ snell_sub_menu() {
             4)  snell_sub_status ;;
             5)  snell_sub_check ;;
             6)  snell_sub_store_hint ;;
-            7)  snell_sub_nginx_hint ;;
+            7)  snell_sub_nginx_apply && snell_sub_links ;;
             8)  snell_sub_reset_token ;;
             9)  snell_sub_change_port ;;
             10) snell_sub_change_server ;;
@@ -3182,21 +3387,14 @@ snell_sub_change_server() {
     echo -e "${GREEN}已更新，服务下次请求即生效${RESET}"
 }
 
+# 公网订阅只走 HTTPS：不再提供 0.0.0.0 明文监听
 snell_sub_toggle_bind() {
     snell_sub_ensure_conf || return 1
-    local current
-    current=$(snell_sub_get SUB_BIND)
-    if [ "$current" = "127.0.0.1" ]; then
-        snell_sub_set SUB_BIND "0.0.0.0"
-        open_port "$(snell_sub_get SUB_PORT)" TCP 2>/dev/null || true
-        snell_sub_restart
-        echo -e "${YELLOW}已改为公网监听，确认防火墙只放行这个端口，且不要泄露 token${RESET}"
+    if [ -f "$SNELL_SUB_NGINX_CONF" ]; then
+        snell_sub_do_local
     else
-        snell_sub_set SUB_BIND "127.0.0.1"
-        snell_sub_restart
-        echo -e "${GREEN}已改回仅本机监听；同机的 Sub-Store 不受影响${RESET}"
+        snell_sub_do_public
     fi
-    snell_sub_links
 }
 
 # 非交互入口：snell sub <动作>
@@ -3210,19 +3408,21 @@ snell_sub_cli() {
         status)         snell_sub_status ;;
         check|test)     snell_sub_check ;;
         store|remote)   snell_sub_store_hint ;;
-        nginx)          snell_sub_nginx_hint ;;
+        nginx|https)    snell_sub_nginx_apply && snell_sub_links ;;
+        nginx-hint)     snell_sub_nginx_hint ;;
+        nginx-off)      snell_sub_nginx_off ;;
         token)          snell_sub_reset_token ;;
         port)           snell_sub_change_port ;;
         server)         snell_sub_change_server ;;
-        public)         snell_sub_set SUB_BIND 0.0.0.0 && snell_sub_restart && snell_sub_links ;;
-        local|private)  snell_sub_set SUB_BIND 127.0.0.1 && snell_sub_restart && snell_sub_links ;;
+        public)         snell_sub_do_public ;;
+        local|private)  snell_sub_do_local ;;
         menu)           snell_sub_menu ;;
         -h|--help|help)
-            echo "用法：snell sub [show|on|off|restart|status|check|store|nginx|token|port|server|public|local|menu]"
+            echo "用法：snell sub [show|on|off|restart|status|check|store|nginx|nginx-hint|nginx-off|token|port|server|public|local|menu]"
             ;;
         *)
             echo -e "${RED}未知动作：${action}${RESET}"
-            echo "用法：snell sub [show|on|off|restart|status|check|store|nginx|token|port|server|public|local|menu]"
+            echo "用法：snell sub [show|on|off|restart|status|check|store|nginx|nginx-hint|nginx-off|token|port|server|public|local|menu]"
             return 1
             ;;
     esac
@@ -3230,7 +3430,7 @@ snell_sub_cli() {
 
 
 #当前版本号
-current_version="6.4"
+current_version="6.5"
 
 # 出口控制（netns + socket activation）默认参数
 EGRESS_FEATURE_ENABLED="false"
