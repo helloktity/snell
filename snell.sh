@@ -2274,6 +2274,8 @@ snell_sub_ensure_conf() {
     grep -q '^SUB_CERT=' "$SNELL_SUB_CONF" 2>/dev/null || snell_sub_set SUB_CERT ""
     grep -q '^SUB_KEY=' "$SNELL_SUB_CONF" 2>/dev/null || snell_sub_set SUB_KEY ""
     grep -q '^SUB_PUBLIC=' "$SNELL_SUB_CONF" 2>/dev/null || snell_sub_set SUB_PUBLIC ""
+    # Clash 目标默认不带 v6：mihomo 在 v1.19.34 之前遇到 version: 6 会整份配置加载失败
+    grep -q '^SUB_INCLUDE_V6=' "$SNELL_SUB_CONF" 2>/dev/null || snell_sub_set SUB_INCLUDE_V6 "0"
 
     # 节点地址与地区只在为空时自动补，用户手动设过就尊重手动值
     if [ -z "$(snell_sub_get SUB_SERVER)" ]; then
@@ -2325,10 +2327,12 @@ a PSK is rotated, and both Sub-Store and the clients must see the new values.
 Extra query parameters (``noCache=true``, ``target=ClashMeta`` ...) are ignored
 so one URL can be shared by Sub-Store and a client.
 
-Two things Clash clients cannot use are filtered out of the Clash targets by
-default, because emitting them would make the whole profile invalid:
+Two things Clash clients historically could not use are filtered out of the
+Clash targets by default, because emitting them would make the whole profile
+invalid:
 
-* Snell v6 (Mihomo only accepts version 4 and 5)
+* Snell v6 - mihomo v1.19.34 (PR #3410) added outbound version 6 support;
+  turn it on with ``SUB_INCLUDE_V6=1`` (``snell sub v6``)
 * ShadowTLS-wrapped nodes (Mihomo's snell outbound has no shadow-tls plugin)
 
 The Surge targets carry everything, since Surge supports all of it. Nothing is
@@ -2355,7 +2359,7 @@ from urllib.parse import parse_qs, urlparse
 CONF_PATH = os.environ.get('SNELL_SUB_CONF', '/etc/snell/.subscription')
 UNIT_DIR = os.environ.get('SNELL_SUB_UNIT_DIR', '/etc/systemd/system')
 
-CLASH_VERSIONS = (4, 5)          # versions the Mihomo snell outbound accepts
+CLASH_VERSIONS = (4, 5)          # mihomo before v1.19.34 only accepts these; v6 via SUB_INCLUDE_V6=1
 IP_CACHE_TTL = 600              # seconds to reuse a detected public address
 UNIT_CACHE_TTL = 15             # seconds to reuse systemd is-active answers
 
@@ -2627,7 +2631,7 @@ def clash_skip_reason(node, include_v6):
     if node['stls']:
         return 'ShadowTLS 需要 Surge，Mihomo 的 snell 出站不支持'
     if node['version'] not in CLASH_VERSIONS and not include_v6:
-        return 'Mihomo 只接受 version 4 / 5'
+        return 'Mihomo v1.19.34 之前只接受 version 4 / 5（snell sub v6 可开启）'
     return ''
 
 
@@ -3022,6 +3026,11 @@ snell_sub_status() {
     echo -e "${CYAN}监听：${RESET}$(snell_sub_get SUB_BIND):$(snell_sub_get SUB_PORT)"
     echo -e "${CYAN}节点地址：${RESET}$(snell_sub_get SUB_SERVER)"
     echo -e "${CYAN}地区标记：${RESET}$(snell_sub_get SUB_COUNTRY)"
+    if [ "$(snell_sub_get SUB_INCLUDE_V6)" = "1" ]; then
+        echo -e "${CYAN}Clash 输出 v6：${RESET}已开启（需要 mihomo v1.19.34+）"
+    else
+        echo -e "${CYAN}Clash 输出 v6：${RESET}未开启（只出 v4 / v5）"
+    fi
     if [ -f "$SNELL_SUB_SVC" ]; then
         echo -e "${CYAN}程序：${RESET}${SNELL_SUB_SVC}"
     fi
@@ -3290,6 +3299,7 @@ snell_sub_menu() {
         echo -e "  ${GREEN}10.${RESET} 设置节点地址 / 地区标记"
         echo -e "  ${GREEN}11.${RESET} 开 / 关公网 HTTPS"
         echo -e "  ${GREEN}12.${RESET} 修改 HTTPS 端口"
+        echo -e "  ${GREEN}13.${RESET} Clash 输出 Snell v6（需 mihomo v1.19.34+）"
         echo -e "  ${GREEN}0.${RESET} 返回主菜单"
         if ! read -rp "  请选择: " choice; then return 0; fi
         case "$choice" in
@@ -3305,6 +3315,7 @@ snell_sub_menu() {
             10) snell_sub_change_server ;;
             11) snell_sub_toggle_bind ;;
             12) snell_sub_change_tls_port ;;
+            13) snell_sub_toggle_v6 ;;
             0)  return 0 ;;
             *)  echo -e "${RED}请输入正确的选项${RESET}" ;;
         esac
@@ -3374,6 +3385,24 @@ snell_sub_change_server() {
     echo -e "${GREEN}已更新，服务下次请求即生效${RESET}"
 }
 
+# Clash 目标是否带上 Snell v6：mihomo v1.19.34（PR #3410）起支持 version 6
+snell_sub_toggle_v6() {
+    snell_sub_ensure_conf || return 1
+    local cur
+    cur=$(snell_sub_get SUB_INCLUDE_V6)
+    if [ "$cur" = "1" ]; then
+        snell_sub_set SUB_INCLUDE_V6 "0"
+        echo -e "${GREEN}已关闭：Clash 目标只输出 v4 / v5${RESET}"
+    else
+        snell_sub_set SUB_INCLUDE_V6 "1"
+        echo -e "${GREEN}已开启：Clash 目标会输出 Snell v6${RESET}"
+        echo -e "${YELLOW}需要 mihomo v1.19.34 及以上；旧版客户端遇到 version: 6 会整份配置加载失败${RESET}"
+        echo -e "${CYAN}Surge / Stash 本来就支持 v6，不受这个开关影响${RESET}"
+    fi
+    echo -e "${CYAN}服务每次请求重读配置，无需重启${RESET}"
+    snell_sub_links
+}
+
 # 公网订阅只走 HTTPS：不再提供 0.0.0.0 明文监听
 snell_sub_toggle_bind() {
     snell_sub_ensure_conf || return 1
@@ -3410,13 +3439,14 @@ snell_sub_cli() {
             fi ;;
         public)         snell_sub_do_public ;;
         local|private)  snell_sub_do_local ;;
+        v6|include-v6)  snell_sub_toggle_v6 ;;
         menu)           snell_sub_menu ;;
         -h|--help|help)
-            echo "用法：snell sub [show|on|off|restart|status|check|store|https|tls-port|token|port|server|public|local|menu]"
+            echo "用法：snell sub [show|on|off|restart|status|check|store|https|tls-port|token|port|server|public|local|v6|menu]"
             ;;
         *)
             echo -e "${RED}未知动作：${action}${RESET}"
-            echo "用法：snell sub [show|on|off|restart|status|check|store|https|tls-port|token|port|server|public|local|menu]"
+            echo "用法：snell sub [show|on|off|restart|status|check|store|https|tls-port|token|port|server|public|local|v6|menu]"
             return 1
             ;;
     esac

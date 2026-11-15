@@ -52,18 +52,20 @@ Sub-Store 可以像订阅 3x-ui 那样用 `source=remote` 订阅本机，Mihomo 
 
 要点：
 
-- **Clash 目标只出 Mihomo 能用的节点**（snell `version` 4 / 5）。v6 与 ShadowTLS 会被跳过，
-  并在响应开头用注释写明跳过了哪个、为什么——因为塞进去会让整个 profile 无效。
+- **Clash 目标默认只出 v4 / v5**：mihomo 在 v1.19.34 之前遇到 `version: 6` 会让整份配置加载失败，
+  所以 v6 与 ShadowTLS 默认跳过，并在响应开头用注释写明跳过了哪个、为什么。
+  客户端是 mihomo v1.19.34+ 时执行 `snell sub v6` 打开，Clash 目标就会带上 v6。
   Surge 目标不过滤，v4 / v5 / v6 与 ShadowTLS 全都出。
 - 服务每次请求都重读 `/etc/snell/users/*.conf` 与 ShadowTLS 的 unit，
   **加用户、改 PSK、切版本立刻生效**，不用重启订阅服务。
 - 配置在 `/etc/snell/.subscription`（600），40 位 token 写在路径里；
   链接等同凭据，泄露后 `snell sub token` 重置。
 - 默认只监听 `127.0.0.1`（同机 Sub-Store 够用）。要给外网用：`snell sub public`
-  —— 自动在 nginx 443 上反代并复用现有证书，只出 HTTPS 链接，**不提供明文 HTTP**。
-  只想要片段自己贴：`snell sub nginx-hint`。
-- 与 Mieru-Plus 共用 `/etc/nginx/conf.d/50-subscription.conf` 这一个 vhost，
-  各自往 `/etc/nginx/snippets/subscription/` 写 location 片段，不会互相顶掉。
+  —— 服务自己另开一个 HTTPS 端口（默认 40332，被占用时自动后移），用本机 IP 证书，
+  **不碰 nginx、不占 443、不提供明文 HTTP**。换端口用 `snell sub tls-port 40333`。
+  证书按 `/root/cert/ip` → `/root/cert/domain` → nginx 在用目录的顺序查找，
+  并用 `openssl -checkip` 校验是否覆盖本机 IP；acme 续期后自动重载，不用重启服务。
+- v6.5 曾用「nginx 443 共享 vhost 反代」实现公网订阅，该方案已废弃。
 - 实现是纯 python3 标准库的 HTTP 服务，不需要 pip；没有 python3 时只跳过订阅，不影响 Snell 本体。
 
 ```bash
@@ -73,7 +75,9 @@ snell sub restart        # 重启
 snell sub status         # 状态
 snell sub check          # 自检：逐个目标请求一次本机端点
 snell sub store          # Sub-Store 里怎么填
-snell sub nginx          # 自动配置公网 HTTPS（nginx 443 + 现有证书）
+snell sub https          # 开公网 HTTPS（独立端口 + 本机 IP 证书）
+snell sub tls-port 40332 # 指定 HTTPS 端口
+snell sub v6             # Clash 目标是否带上 v6（mihomo v1.19.34+）
 snell sub token          # 重置 token
 snell sub port | server  # 改订阅端口 / 节点地址
 snell sub public | local # 开 / 关公网 HTTPS（不再有明文监听）

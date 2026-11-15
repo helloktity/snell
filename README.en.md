@@ -55,19 +55,22 @@ Enabled automatically on install; manage it from menu item 14 or from the CLI:
 
 Notes:
 
-- **The Clash targets only emit what Mihomo can run** (snell `version` 4 / 5). v6 and
-  ShadowTLS nodes are skipped and listed in a comment at the top of the response — emitting
-  them would make the whole profile invalid. The Surge targets carry everything.
+- **The Clash targets emit v4 / v5 only by default**: mihomo before v1.19.34 rejects
+  `version: 6` and fails to load the whole profile, so v6 and ShadowTLS nodes are skipped
+  and listed in a comment at the top of the response. On mihomo v1.19.34+ run `snell sub v6`
+  to include v6 in the Clash targets. The Surge targets carry everything regardless.
 - Every request re-reads `/etc/snell/users/*.conf` and the ShadowTLS units, so adding a
   user, rotating a PSK or switching versions shows up immediately, with no restart.
 - Config lives in `/etc/snell/.subscription` (600), the 40-char token is part of the path.
   The link is a credential: `snell sub token` rotates it.
 - Listens on `127.0.0.1` only by default (enough for Sub-Store on the same host).
-  For external access run `snell sub public`: it auto-configures an nginx reverse proxy on
-  port 443 reusing the machine's existing certificate and only emits HTTPS links — plain HTTP
-  is not offered. Want the snippet instead? `snell sub nginx-hint`.
-- Shares a single `/etc/nginx/conf.d/50-subscription.conf` vhost with Mieru-Plus; each script
-  drops its own location snippet under `/etc/nginx/snippets/subscription/`.
+  For external access run `snell sub public`: the service opens its own HTTPS port
+  (40332 by default, auto-shifted when taken) with the machine's IP certificate —
+  it does not touch nginx, does not take port 443, and never serves plain HTTP.
+  Change the port with `snell sub tls-port 40333`. Certificates are looked up under
+  `/root/cert/ip` → `/root/cert/domain` → the directory nginx is using, validated with
+  `openssl -checkip` against the machine's IP, and hot-reloaded after an acme renewal.
+- v6.5 used an nginx 443 shared vhost for public subscriptions; that approach is deprecated.
 - Pure python3 standard library, no pip. Without python3 only the subscription is skipped.
 
 ```bash
@@ -75,7 +78,9 @@ snell sub                # show the links
 snell sub on | off       # enable / disable
 snell sub check          # request every target once against the local endpoint
 snell sub store          # what to put into Sub-Store
-snell sub nginx          # reverse-proxy snippet
+snell sub https          # public HTTPS (own port + local IP certificate)
+snell sub tls-port 40332 # pick the HTTPS port
+snell sub v6             # include Snell v6 in the Clash targets (mihomo v1.19.34+)
 snell sub token          # rotate the token
 ```
 
