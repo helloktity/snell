@@ -59,22 +59,15 @@ snell_sub_ensure_conf() {
     # Clash 目标默认不带 v6：mihomo 在 v1.19.34 之前遇到 version: 6 会整份配置加载失败
     grep -q '^SUB_INCLUDE_V6=' "$SNELL_SUB_CONF" 2>/dev/null || snell_sub_set SUB_INCLUDE_V6 "0"
 
-    # 节点地址与地区只在为空时自动补，用户手动设过就尊重手动值
+    # 节点地址只在为空时自动补，用户手动设过就尊重手动值
     if [ -z "$(snell_sub_get SUB_SERVER)" ]; then
         local ip
         ip=$(get_public_ipv4 2>/dev/null)
         [ -n "$ip" ] && snell_sub_set SUB_SERVER "$ip"
     fi
-    if [ -z "$(snell_sub_get SUB_COUNTRY)" ]; then
-        local address country
-        address=$(snell_sub_get SUB_SERVER)
-        if [ -n "$address" ]; then
-            country=$(get_ip_country "$address" 2>/dev/null)
-            case "$country" in
-                [A-Z][A-Z]) snell_sub_set SUB_COUNTRY "$country" ;;
-            esac
-        fi
-    fi
+    # 地区前缀默认留空，且不自动探测：节点名带上 US / JP 这类标记后，
+    # 客户端会按名字把它们归到对应的地区分组，想单独选某一条反而找不到。
+    # 需要前缀时到菜单「地区标记」里手动设置。
     return 0
 }
 
