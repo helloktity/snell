@@ -107,7 +107,13 @@ Routes (TOKEN comes from ``/etc/snell/.subscription``)::
 Every response is ``no-store``: the accounts change whenever a user is added or
 a PSK is rotated, and both Sub-Store and the clients must see the new values.
 Extra query parameters (``noCache=true``, ``target=ClashMeta`` ...) are ignored
-so one URL can be shared by Sub-Store and a client.
+so one URL can be shared by Sub-Store and a client.  ``notes=1`` appends the
+"why was this node skipped" comments; they are off by default because some
+mobile clients reject any line that is not a ``- {...}`` proxy entry.
+
+Clash targets emit one proxy per line as a flow mapping (``- {"name":...}``),
+not the indented block form: iOS clients in the Clash family (Stash and
+friends) drop multi-line proxy blocks, the whole node silently disappears.
 
 Two things Clash clients historically could not use are filtered out of the
 Clash targets by default, because emitting them would make the whole profile
@@ -417,45 +423,76 @@ def clash_skip_reason(node, include_v6):
     return ''
 
 
-def render_clash(nodes, conf, hidden, include_v6=False):
-    lines = []
-    skipped = []
+def clash_objects(nodes, include_v6):
+    """Split nodes into (usable, skipped) for Clash-family targets."""
     usable = []
+    skipped = []
     for node in nodes:
         reason = clash_skip_reason(node, include_v6)
         if reason:
             skipped.append('%s（%s）' % (node['name'], reason))
         else:
             usable.append(node)
+    return usable, skipped
 
+
+def clash_entry(node):
+    """One proxy as a single-line flow mapping.
+
+    iOS 的 Clash 系客户端（Stash / ClashX 移动端等）解析不了块式写法，
+    多行缩进的节点会被当成非法条目整条丢掉，只认 ``- {json}`` 这种单行流式映射。
+    """
+    item = {
+        'name': node['name'],
+        'type': 'snell',
+        'server': node['server'],
+        'port': node['port'],
+        'psk': node['psk'],
+        'version': node['version'],
+        'udp': bool(node['udp']),
+        'reuse': True,
+    }
+    if node['version'] >= 6 and node.get('mode'):
+        item['mode'] = node['mode']
+    return json.dumps(item, ensure_ascii=False, separators=(',', ':'))
+
+
+def clash_notes(hidden, skipped):
+    """Optional ``#`` comments; off by default so strict clients never see them."""
+    notes = []
     if skipped:
-        lines.append('# 已跳过 %d 个此目标无法使用的节点：' % len(skipped))
+        notes.append('# 已跳过 %d 个此目标无法使用的节点：' % len(skipped))
         for item in skipped:
-            lines.append('#   - %s' % item)
+            notes.append('#   - %s' % item)
     if hidden:
-        lines.append('# 已跳过 %d 个未在运行的服务：%s'
+        notes.append('# 已跳过 %d 个未在运行的服务：%s'
                      % (len(hidden), ', '.join(str(u['port']) for u in hidden)))
-    if not usable:
-        lines.append('# 没有可用的节点：本机只有 Surge 才能用的 Snell（v6 / ShadowTLS）')
-        lines.append('proxies: []')
+    return notes
 
-    if usable:
-        lines.append('proxies:')
+
+def render_clash(nodes, conf, hidden, include_v6=False, notes=False):
+    lines = []
+    usable, skipped = clash_objects(nodes, include_v6)
+
+    if notes:
+        lines.extend(clash_notes(hidden, skipped))
+
+    if not usable:
+        if notes:
+            lines.append('# 没有可用的节点：本机只有 Surge 才能用的 Snell（v6 / ShadowTLS）')
+        lines.append('proxies: []')
+        return '\n'.join(lines) + '\n'
+
+    lines.append('proxies:')
     for node in usable:
-        lines.append('  - name: %s' % yaml_quote(node['name']))
-        lines.append('    type: snell')
-        lines.append('    server: %s' % yaml_quote(node['server']))
-        lines.append('    port: %d' % node['port'])
-        lines.append('    psk: %s' % yaml_quote(node['psk']))
-        lines.append('    version: %d' % node['version'])
-        if node['udp']:
-            lines.append('    udp: true')
+        lines.append('- %s' % clash_entry(node))
     return '\n'.join(lines) + '\n'
 
 
-def render_clash_full(nodes, conf, hidden, include_v6=False):
-    fragment = render_clash(nodes, conf, hidden, include_v6)
-    names = re.findall(r'^  - name: "(.*)"$', fragment, re.M)
+def render_clash_full(nodes, conf, hidden, include_v6=False, notes=False):
+    fragment = render_clash(nodes, conf, hidden, include_v6, notes)
+    usable, _skipped = clash_objects(nodes, include_v6)
+    names = [node['name'] for node in usable]
     head = [
         '# Snell-Plus 生成的完整 Clash 配置（可直接导入 Mihomo / Clash Verge）',
         'mixed-port: 7890',
@@ -523,13 +560,13 @@ def render_json(nodes):
     return json.dumps({'proxies': payload}, ensure_ascii=False, indent=2) + '\n'
 
 
-def render(target):
+def render(target, notes=False):
     conf = read_conf()
     nodes, hidden = build_nodes(conf)
     include_v6 = conf_value(conf, 'SUB_INCLUDE_V6') == '1'
 
     if target in ('clash-full', 'full', 'config'):
-        return render_clash_full(nodes, conf, hidden, include_v6), 'text/yaml; charset=utf-8'
+        return render_clash_full(nodes, conf, hidden, include_v6, notes), 'text/yaml; charset=utf-8'
     if target in ('surge', 'surge-list'):
         return render_surge(nodes, hidden), 'text/plain; charset=utf-8'
     if target in ('base64', 'b64', 'v2ray', 'general'):
@@ -537,7 +574,7 @@ def render(target):
         return base64.b64encode(text.encode('utf-8')).decode('ascii') + '\n', 'text/plain; charset=utf-8'
     if target in ('json', 'js'):
         return render_json(nodes), 'application/json; charset=utf-8'
-    return render_clash(nodes, conf, hidden, include_v6), 'text/yaml; charset=utf-8'
+    return render_clash(nodes, conf, hidden, include_v6, notes), 'text/yaml; charset=utf-8'
 
 
 PATH_TARGETS = {
@@ -605,9 +642,10 @@ class Handler(BaseHTTPRequestHandler):
         target = (query.get('target') or [''])[0].strip().lower()
         if not target:
             target = PATH_TARGETS[tail]
+        notes = (query.get('notes') or [''])[0].strip().lower() in ('1', 'true', 'yes', 'on')
 
         try:
-            text, content_type = render(target)
+            text, content_type = render(target, notes)
         except Exception as exc:                             # noqa: BLE001 - report, never crash the service
             sys.stderr.write('render failed: %r\n' % (exc,))
             self._send(500, 'render failed\n')
